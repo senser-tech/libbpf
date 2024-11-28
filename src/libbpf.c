@@ -59,7 +59,7 @@
 #define BPF_FS_MAGIC		0xcafe4a11
 #endif
 
-#define PERF_EVENT_DEBUG_SEQ_ID (0)
+#define PERF_EVENT_DEBUG_SEQ_ID (1)
 
 #define BPF_INSN_SZ (sizeof(struct bpf_insn))
 
