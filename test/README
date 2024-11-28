@@ -1,0 +1,10 @@
+
+
+compile ebpf:
+clang -g -O2 -march=bpf -mcpu=v3 -target bpf -DCORE -D__TARGET_ARCH_x86 -I /usr/include/bpf -I/include/uapi -I/senser/packages/go/src/agent/ebpf/c -I/senser/packages/go/src/agent/ebpf/c/arch/x86// -I/senser/packages/go/src/agent/ebpf/c/conn_stats -I/senser/packages/go/src/agent/ebpf/c/protocols -I/senser/packages/go/src/agent/ebpf/c/protocols/classification -I/senser/packages/go/src/agent/ebpf/c/protocols/http -I/senser/packages/go/src/agent/ebpf/c/protocols/http2 -I/senser/packages/go/src/agent/ebpf/c/common -I/senser/packages/go/src/agent/ebpf/c/main -I/senser/packages/go/src/agent/ebpf/c/open_ssl -I/senser/packages/go/src/agent/ebpf/c/node_tls -idirafter /usr/lib/llvm-14/lib/clang/14.0.0/include -idirafter /usr/local/include -idirafter /usr/include/x86_64-linux-gnu -idirafter /usr/include -c ebpf.test.c -o ebpf.o 
+
+compile test:
+gcc -o main main.c -g -O0 -Lsrc -lbpf -lelf
+
+run:
+LD_PRELOAD=src/libbpf.so ./main

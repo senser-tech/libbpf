@@ -59,6 +59,8 @@
 #define BPF_FS_MAGIC		0xcafe4a11
 #endif
 
+#define PERF_EVENT_DEBUG_SEQ_ID (0)
+
 #define BPF_INSN_SZ (sizeof(struct bpf_insn))
 
 /* vsprintf() in __base_pr() uses nonliteral format string. It may break
@@ -11452,6 +11454,13 @@ struct bpf_link *bpf_map__attach_struct_ops(const struct bpf_map *map)
 typedef enum bpf_perf_event_ret (*bpf_perf_event_print_t)(struct perf_event_header *hdr,
 							  void *private_data);
 
+struct perf_sample_raw {
+	struct perf_event_header header;
+	uint32_t size;
+	char data[];
+};
+
+
 static enum bpf_perf_event_ret
 perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
 		       void **copy_mem, size_t *copy_size,
@@ -11465,6 +11474,7 @@ perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
 	struct perf_event_header *ehdr;
 	size_t ehdr_size;
 
+	int64_t last_seen = -1;
 	while (data_head != data_tail) {
 		ehdr = base + (data_tail & (mmap_size - 1));
 		ehdr_size = ehdr->size;
@@ -11489,6 +11499,29 @@ perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
 			memcpy(*copy_mem + len_first, base, len_secnd);
 			ehdr = *copy_mem;
 		}
+
+		if (ehdr->type == PERF_RECORD_SAMPLE) {
+			void *data = ehdr;
+			struct perf_sample_raw *s = data;
+			if (s->size > 8)  {
+				uint64_t seq_id = *((uint64_t *)s->data);
+				if (last_seen == -1) {
+					if (PERF_EVENT_DEBUG_SEQ_ID) {
+						printf("\thandling seq id: %lu\n", seq_id);
+					}
+					last_seen = seq_id;
+				} else {
+					if (last_seen + 1 != seq_id) {
+						break;
+					}
+					if (PERF_EVENT_DEBUG_SEQ_ID) {
+						printf("\thandling seq id: %lu\n", seq_id);
+					}
+					last_seen = seq_id;
+				}
+			}
+		}
+
 
 		ret = fn(ehdr, private_data);
 		data_tail += ehdr_size;
@@ -11833,11 +11866,6 @@ error:
 	return ERR_PTR(err);
 }
 
-struct perf_sample_raw {
-	struct perf_event_header header;
-	uint32_t size;
-	char data[];
-};
 
 struct perf_sample_lost {
 	struct perf_event_header header;
@@ -11898,6 +11926,71 @@ int perf_buffer__epoll_fd(const struct perf_buffer *pb)
 	return pb->epoll_fd;
 }
 
+struct cpus_seq_id {
+	uint64_t seq_id;
+	int event_id;
+};
+
+int compare__cpus_seq_id(const void* a, const void* b)
+{
+    const struct cpus_seq_id* int_a = a;
+    const struct cpus_seq_id* int_b = b;
+     
+     if ( int_a->seq_id == int_b->seq_id ) return 0;
+     else if ( int_a->seq_id < int_b->seq_id ) return -1;
+     else return 1;
+}
+
+int64_t perf_cpu_buf__get_seq_id(struct perf_buffer *pb, struct perf_cpu_buf *cpu_buf){
+	void *mmap_mem = cpu_buf->base;
+	size_t mmap_size = pb->mmap_size;
+	size_t page_size = pb->page_size;
+
+	struct perf_event_mmap_page *header = mmap_mem;
+	__u64 data_head = ring_buffer_read_head(header);
+	__u64 data_tail = header->data_tail;
+	void *base = ((__u8 *)header) + page_size;
+	struct perf_event_header *ehdr;
+	#define SEQ_ID_SIZE (sizeof(uint64_t))
+	size_t ehdr_size = sizeof(struct perf_sample_raw) + SEQ_ID_SIZE;
+
+	if (data_head == data_tail) {
+		return -1;
+	}
+	ehdr = base + (data_tail & (mmap_size - 1));
+
+	void *copy_mem = NULL;
+	if (((void *)ehdr) + ehdr_size > base + mmap_size) {
+		void *copy_start = ehdr;
+		size_t len_first = base + mmap_size - copy_start;
+		size_t len_secnd = ehdr_size - len_first;
+
+		copy_mem = malloc(ehdr_size);
+		if (!copy_mem) {
+			return -1;
+		}
+
+		memcpy(copy_mem, copy_start, len_first);
+		memcpy(copy_mem + len_first, base, len_secnd);
+		ehdr = copy_mem;
+	}
+
+	int64_t seq_id = -1;
+	if (ehdr->type == PERF_RECORD_SAMPLE) {
+		void *data = ehdr;
+		struct perf_sample_raw *s = data;
+		if (s->size > 8) {
+			seq_id = *((uint64_t *)s->data);
+		}
+	}
+
+	if (copy_mem) {
+		free(copy_mem);
+	}
+
+	return seq_id;
+}
+
 int perf_buffer__poll(struct perf_buffer *pb, int timeout_ms)
 {
 	int i, cnt, err;
@@ -11905,14 +11998,42 @@ int perf_buffer__poll(struct perf_buffer *pb, int timeout_ms)
 	cnt = epoll_wait(pb->epoll_fd, pb->events, pb->cpu_cnt, timeout_ms);
 	if (cnt < 0)
 		return -errno;
+	
+	if (cnt == 0)
+		return cnt;
 
-	for (i = 0; i < cnt; i++) {
-		struct perf_cpu_buf *cpu_buf = pb->events[i].data.ptr;
+	struct cpus_seq_id cpus_seq_ids[pb->cpu_cnt];
+	while(1) {
+		int n_non_empty_cnt = 0;
+		for (i = 0; i < pb->cpu_cnt; i++) {
+			struct perf_cpu_buf *cpu_buf = pb->cpu_bufs[i];
+			int64_t queue_first_seq_id = perf_cpu_buf__get_seq_id(pb, cpu_buf);
+			if (queue_first_seq_id >= 0) {
+				cpus_seq_ids[n_non_empty_cnt].seq_id = queue_first_seq_id;
+				cpus_seq_ids[n_non_empty_cnt].event_id = i;
+				n_non_empty_cnt++;
+			} else {
+				int x=0;
+				x++;
+			}
+		}
+		
+		if (n_non_empty_cnt > 0) {
+			qsort(cpus_seq_ids, n_non_empty_cnt, sizeof(struct cpus_seq_id), compare__cpus_seq_id);
+			
+			int event_id = cpus_seq_ids[0].event_id;
+			if (PERF_EVENT_DEBUG_SEQ_ID) {
+				printf("handling start seq id: %lu, q %d\n", cpus_seq_ids[0].seq_id, event_id);
+			}
+			struct perf_cpu_buf *cpu_buf = pb->cpu_bufs[event_id];
 
-		err = perf_buffer__process_records(pb, cpu_buf);
-		if (err) {
-			pr_warn("error while processing records: %d\n", err);
-			return libbpf_err(err);
+			err = perf_buffer__process_records(pb, cpu_buf);
+			if (err) {
+				pr_warn("error while processing records: %d\n", err);
+				return libbpf_err(err);
+			}
+		} else {
+			return cnt;
 		}
 	}
 	return cnt;

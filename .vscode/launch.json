@@ -1,0 +1,38 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "build_bpf_before_agent",
+            "command": "clang -g -O2 -march=bpf -mcpu=v3 -target bpf -DCORE -D__TARGET_ARCH_x86 -I /usr/include/bpf -I/include/uapi -I/senser/packages/go/src/agent/ebpf/c -I/senser/packages/go/src/agent/ebpf/c/arch/x86// -I/senser/packages/go/src/agent/ebpf/c/conn_stats -I/senser/packages/go/src/agent/ebpf/c/protocols -I/senser/packages/go/src/agent/ebpf/c/protocols/classification -I/senser/packages/go/src/agent/ebpf/c/protocols/http -I/senser/packages/go/src/agent/ebpf/c/protocols/http2 -I/senser/packages/go/src/agent/ebpf/c/common -I/senser/packages/go/src/agent/ebpf/c/main -I/senser/packages/go/src/agent/ebpf/c/open_ssl -I/senser/packages/go/src/agent/ebpf/c/node_tls -idirafter /usr/lib/llvm-14/lib/clang/14.0.0/include -idirafter /usr/local/include -idirafter /usr/include/x86_64-linux-gnu -idirafter /usr/include -c ebpf.test.c -o ebpf.o && ", // Could be any other shell command
+            "type": "shell"
+        }
+    ],
+    "configurations": [
+    {
+        "name": "(gdb) main",
+        "type": "cppdbg",
+        "request": "launch",
+        "program": "${workspaceFolder}/main",
+        "args": [],
+        "stopAtEntry": false,
+        "cwd": "/senser/libbpf",
+        "environment": [{"name": "LD_PRELOAD", "value": "/senser/libbpf/src/libbpf.so"}],
+        "externalConsole": false,
+        "MIMode": "gdb",
+        "setupCommands": [
+            {
+                "description": "Enable pretty-printing for gdb",
+                "text": "-enable-pretty-printing",
+                "ignoreFailures": true
+            },
+            {
+                "description": "Set Disassembly Flavor to Intel",
+                "text": "-gdb-set disassembly-flavor intel",
+                "ignoreFailures": true
+            }
+        ]
+    }
+    ]
+}
