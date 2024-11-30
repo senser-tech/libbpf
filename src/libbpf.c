@@ -59,7 +59,7 @@
 #define BPF_FS_MAGIC		0xcafe4a11
 #endif
 
-#define PERF_EVENT_DEBUG_SEQ_ID (1)
+#define PERF_EVENT_DEBUG_SEQ_ID (0)
 
 #define BPF_INSN_SZ (sizeof(struct bpf_insn))
 
@@ -11464,7 +11464,7 @@ struct perf_sample_raw {
 static enum bpf_perf_event_ret
 perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
 		       void **copy_mem, size_t *copy_size,
-		       bpf_perf_event_print_t fn, void *private_data)
+		       bpf_perf_event_print_t fn, void *private_data, int64_t upto_time, uint8_t is_ordered)
 {
 	struct perf_event_mmap_page *header = mmap_mem;
 	__u64 data_head = ring_buffer_read_head(header);
@@ -11474,7 +11474,7 @@ perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
 	struct perf_event_header *ehdr;
 	size_t ehdr_size;
 
-	int64_t last_seen = -1;
+	int n_handled = 0;
 	while (data_head != data_tail) {
 		ehdr = base + (data_tail & (mmap_size - 1));
 		ehdr_size = ehdr->size;
@@ -11500,32 +11500,28 @@ perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
 			ehdr = *copy_mem;
 		}
 
-		if (ehdr->type == PERF_RECORD_SAMPLE) {
+		if (is_ordered && ehdr->type == PERF_RECORD_SAMPLE) {
 			void *data = ehdr;
 			struct perf_sample_raw *s = data;
-			if (s->size > 8)  {
-				uint64_t seq_id = *((uint64_t *)s->data);
-				if (last_seen == -1) {
-					if (PERF_EVENT_DEBUG_SEQ_ID) {
-						printf("\thandling seq id: %lu\n", seq_id);
-					}
-					last_seen = seq_id;
-				} else {
-					if (last_seen + 1 != seq_id) {
-						break;
-					}
-					if (PERF_EVENT_DEBUG_SEQ_ID) {
-						printf("\thandling seq id: %lu\n", seq_id);
-					}
-					last_seen = seq_id;
-				}
+			uint64_t seq_id = *((uint64_t *)s->data);
+			if (upto_time != -1 && seq_id > upto_time) {
+				break;
 			}
+
+			if (n_handled > 10) {
+				break;
+			}
+
+			if (PERF_EVENT_DEBUG_SEQ_ID) {
+				printf("\thandling seq id: %lu\n", seq_id);
+			}
+			n_handled += 1;
 		}
 
 
 		ret = fn(ehdr, private_data);
 		data_tail += ehdr_size;
-		if (ret != LIBBPF_PERF_EVENT_CONT)
+		if (ret != LIBBPF_PERF_EVENT_CONT || (is_ordered && ehdr->type != PERF_RECORD_SAMPLE))
 			break;
 	}
 
@@ -11908,14 +11904,14 @@ perf_buffer__process_record(struct perf_event_header *e, void *ctx)
 }
 
 static int perf_buffer__process_records(struct perf_buffer *pb,
-					struct perf_cpu_buf *cpu_buf)
+					struct perf_cpu_buf *cpu_buf, int64_t upto_time, uint8_t is_ordered)
 {
 	enum bpf_perf_event_ret ret;
 
 	ret = perf_event_read_simple(cpu_buf->base, pb->mmap_size,
 				     pb->page_size, &cpu_buf->buf,
 				     &cpu_buf->buf_size,
-				     perf_buffer__process_record, cpu_buf);
+				     perf_buffer__process_record, cpu_buf, upto_time, is_ordered);
 	if (ret != LIBBPF_PERF_EVENT_CONT)
 		return ret;
 	return 0;
@@ -11982,6 +11978,8 @@ int64_t perf_cpu_buf__get_seq_id(struct perf_buffer *pb, struct perf_cpu_buf *cp
 		if (s->size > 8) {
 			seq_id = *((uint64_t *)s->data);
 		}
+	} else {
+		seq_id = 0;
 	}
 
 	if (copy_mem) {
@@ -11989,6 +11987,44 @@ int64_t perf_cpu_buf__get_seq_id(struct perf_buffer *pb, struct perf_cpu_buf *cp
 	}
 
 	return seq_id;
+}
+
+int perf_buffer__poll_ordered(struct perf_buffer *pb) {
+	struct cpus_seq_id cpus_seq_ids[pb->cpu_cnt];
+	while(1) {
+		int n_non_empty_cnt = 0;
+		int i;
+		for (i = 0; i < pb->cpu_cnt; i++) {
+			struct perf_cpu_buf *cpu_buf = pb->cpu_bufs[i];
+			int64_t queue_first_seq_id = perf_cpu_buf__get_seq_id(pb, cpu_buf);
+			if (queue_first_seq_id >= 0) {
+				cpus_seq_ids[n_non_empty_cnt].seq_id = queue_first_seq_id;
+				cpus_seq_ids[n_non_empty_cnt].event_id = i;
+				n_non_empty_cnt++;
+			}
+		}
+		
+		if (n_non_empty_cnt > 0) {
+			qsort(cpus_seq_ids, n_non_empty_cnt, sizeof(struct cpus_seq_id), compare__cpus_seq_id);
+			
+			int event_id = cpus_seq_ids[0].event_id;
+			struct perf_cpu_buf *cpu_buf = pb->cpu_bufs[event_id];
+			int64_t upto_time = -1;
+			if (n_non_empty_cnt > 1) {
+				upto_time = cpus_seq_ids[1].seq_id;
+			}
+			
+			if (PERF_EVENT_DEBUG_SEQ_ID) {
+				printf("%d: handling start seq id: %lu (upto %ld), q %d\n", pb->map_fd, cpus_seq_ids[0].seq_id, upto_time, event_id);
+			}
+			int err = perf_buffer__process_records(pb, cpu_buf, upto_time, 1);
+			if (err) {
+				pr_warn("error while processing records: %d\n", err);
+				return libbpf_err(err);
+			}
+		}
+	}
+	return 0;
 }
 
 int perf_buffer__poll(struct perf_buffer *pb, int timeout_ms)
@@ -12002,40 +12038,23 @@ int perf_buffer__poll(struct perf_buffer *pb, int timeout_ms)
 	if (cnt == 0)
 		return cnt;
 
-	struct cpus_seq_id cpus_seq_ids[pb->cpu_cnt];
-	while(1) {
-		int n_non_empty_cnt = 0;
-		for (i = 0; i < pb->cpu_cnt; i++) {
-			struct perf_cpu_buf *cpu_buf = pb->cpu_bufs[i];
-			int64_t queue_first_seq_id = perf_cpu_buf__get_seq_id(pb, cpu_buf);
-			if (queue_first_seq_id >= 0) {
-				cpus_seq_ids[n_non_empty_cnt].seq_id = queue_first_seq_id;
-				cpus_seq_ids[n_non_empty_cnt].event_id = i;
-				n_non_empty_cnt++;
-			} else {
-				int x=0;
-				x++;
-			}
-		}
-		
-		if (n_non_empty_cnt > 0) {
-			qsort(cpus_seq_ids, n_non_empty_cnt, sizeof(struct cpus_seq_id), compare__cpus_seq_id);
-			
-			int event_id = cpus_seq_ids[0].event_id;
-			if (PERF_EVENT_DEBUG_SEQ_ID) {
-				printf("handling start seq id: %lu, q %d\n", cpus_seq_ids[0].seq_id, event_id);
-			}
-			struct perf_cpu_buf *cpu_buf = pb->cpu_bufs[event_id];
+	if (pb->lost_cb) {
+		for (i = 0; i < cnt; i++) {
+			struct perf_cpu_buf *cpu_buf = pb->events[i].data.ptr;
 
-			err = perf_buffer__process_records(pb, cpu_buf);
+			err = perf_buffer__process_records(pb, cpu_buf, -1, 0);
 			if (err) {
-				pr_warn("error while processing records: %d\n", err);
+				// pr_warn("error while processing records: %s\n", errstr(err));
 				return libbpf_err(err);
 			}
-		} else {
-			return cnt;
+		}
+	} else {
+		err = perf_buffer__poll_ordered(pb);
+		if (err) {
+			return err;
 		}
 	}
+	
 	return cnt;
 }
 
@@ -12101,7 +12120,7 @@ int perf_buffer__consume_buffer(struct perf_buffer *pb, size_t buf_idx)
 	if (!cpu_buf)
 		return libbpf_err(-ENOENT);
 
-	return perf_buffer__process_records(pb, cpu_buf);
+	return perf_buffer__process_records(pb, cpu_buf, -1, 0);
 }
 
 int perf_buffer__consume(struct perf_buffer *pb)
@@ -12114,7 +12133,7 @@ int perf_buffer__consume(struct perf_buffer *pb)
 		if (!cpu_buf)
 			continue;
 
-		err = perf_buffer__process_records(pb, cpu_buf);
+		err = perf_buffer__process_records(pb, cpu_buf, -1, 0);
 		if (err) {
 			pr_warn("perf_buffer: failed to process records in buffer #%d: %d\n", i, err);
 			return libbpf_err(err);
