@@ -11540,6 +11540,7 @@ struct perf_buffer_params {
 	perf_buffer_lost_fn lost_cb;
 	void *ctx;
 	int cpu_cnt;
+	int is_ordering;
 	int *cpus;
 	int *map_keys;
 };
@@ -11567,6 +11568,7 @@ struct perf_buffer {
 	int cpu_cnt; /* number of allocated CPU buffers */
 	int epoll_fd; /* perf event FD */
 	int map_fd; /* BPF_MAP_TYPE_PERF_EVENT_ARRAY BPF map FD */
+	int is_ordering;
 };
 
 static void perf_buffer__free_cpu_buf(struct perf_buffer *pb,
@@ -11666,7 +11668,7 @@ struct perf_buffer *perf_buffer__new(int map_fd, size_t page_cnt,
 				     perf_buffer_sample_fn sample_cb,
 				     perf_buffer_lost_fn lost_cb,
 				     void *ctx,
-				     const struct perf_buffer_opts *opts)
+				     const struct perf_buffer_opts *opts, int is_ordering)
 {
 	const size_t attr_sz = sizeof(struct perf_event_attr);
 	struct perf_buffer_params p = {};
@@ -11687,8 +11689,10 @@ struct perf_buffer *perf_buffer__new(int map_fd, size_t page_cnt,
 	p.sample_cb = sample_cb;
 	p.lost_cb = lost_cb;
 	p.ctx = ctx;
+	p.is_ordering = is_ordering;
 
-	return libbpf_ptr(__perf_buffer__new(map_fd, page_cnt, &p));
+	void* ptr = libbpf_ptr(__perf_buffer__new(map_fd, page_cnt, &p));
+	return ptr;
 }
 
 struct perf_buffer *perf_buffer__new_raw(int map_fd, size_t page_cnt,
@@ -11759,6 +11763,7 @@ static struct perf_buffer *__perf_buffer__new(int map_fd, size_t page_cnt,
 	if (!pb)
 		return ERR_PTR(-ENOMEM);
 
+	pb->is_ordering = p->is_ordering;
 	pb->event_cb = p->event_cb;
 	pb->sample_cb = p->sample_cb;
 	pb->lost_cb = p->lost_cb;
@@ -12038,7 +12043,9 @@ int perf_buffer__poll(struct perf_buffer *pb, int timeout_ms)
 	if (cnt == 0)
 		return cnt;
 
-	if (pb->lost_cb) {
+
+	// printf("%p: %d\n", pb, pb->is_ordering);
+	if (pb->is_ordering == 0) {
 		for (i = 0; i < cnt; i++) {
 			struct perf_cpu_buf *cpu_buf = pb->events[i].data.ptr;
 

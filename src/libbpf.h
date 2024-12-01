@@ -1058,7 +1058,7 @@ struct perf_buffer_opts {
 LIBBPF_API struct perf_buffer *
 perf_buffer__new(int map_fd, size_t page_cnt,
 		 perf_buffer_sample_fn sample_cb, perf_buffer_lost_fn lost_cb, void *ctx,
-		 const struct perf_buffer_opts *opts);
+		 const struct perf_buffer_opts *opts, int is_ordering);
 
 enum bpf_perf_event_ret {
 	LIBBPF_PERF_EVENT_DONE	= 0,
