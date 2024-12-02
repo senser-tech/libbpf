@@ -11504,7 +11504,7 @@ perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
 			void *data = ehdr;
 			struct perf_sample_raw *s = data;
 			uint64_t seq_id = *((uint64_t *)s->data);
-			if (upto_time != -1 && seq_id > upto_time) {
+			if (upto_time > 0 && seq_id > upto_time) {
 				break;
 			}
 
@@ -12027,6 +12027,8 @@ int perf_buffer__poll_ordered(struct perf_buffer *pb) {
 				pr_warn("error while processing records: %d\n", err);
 				return libbpf_err(err);
 			}
+		} else {
+			break;
 		}
 	}
 	return 0;
